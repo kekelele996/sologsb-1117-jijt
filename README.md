@@ -66,26 +66,37 @@ sologsb-1117/
 │   ├── nginx.conf              # try_files 前端路由回落 + gzip
 │   ├── public/favicon.svg
 │   └── src/
-│       ├── types/              # orchard.ts / colony.ts / droppoint.ts / route.ts / index.ts
-│       ├── stores/             # orchardStore / colonyStore / droppointStore / routeStore（Zustand）
+│       ├── types/              # orchard.ts / colony.ts / droppoint.ts / placement.ts / route.ts / index.ts
+│       ├── stores/             # orchardStore / colonyStore / droppointStore / placementStore / colonyChangeStore / routeStore（Zustand）
 │       ├── components/common/  # RouteMap / FlowerWindowBar / StatusTag / CoordPicker
 │       ├── hooks/              # useAmap / usePersistentStore
 │       ├── pages/              # SchedulePage / OrchardsPage / ColoniesPage / RoutesPage / ExportPage
 │       ├── router/index.tsx
-│       └── utils/              # geo.ts / export.ts / id.ts
+│       └── utils/              # geo.ts / colonyOps.ts（分并纯计算）/ reconcile.ts（容量重算）/ export.ts / id.ts
 ```
 
 ## 六、数据模型与存储
 
-| 模型 | 说明 | Dexie 表 |
-| --- | --- | --- |
-| Orchard 果园地块 | 地块名、作物、面积、经纬度、盛花期起止、需蜂强度（箱/亩）、园主联系方式、可达性、历史授粉年份 | `orchards` |
-| BeeColony 蜂群 | 群号、蜂种、群势（足框）、箱型、当前所在地块、状态（待投放/在园/转场中/回场）、最近检查日期、健康备注 | `colonies` |
-| DropPoint 投放点 | 所属地块、坐标、编号、可容纳箱数、遮阴条件、水源距离、投放时间窗、撤场时间、责任人、安排群号 | `dropPoints` |
-| TransitRoute 转场路线 | 出发/到达投放点、预计里程与耗时、车辆类型、出发时刻、风险备注、实际记录 | `routes` |
+| 模型 | 说明 | 归属 | Dexie 表 |
+| --- | --- | --- | --- |
+| Orchard 果园地块 | 地块名、作物、面积、经纬度、盛花期起止、需蜂强度（箱/亩）、园主联系方式、可达性、历史授粉年份 | 托管队 | `orchards` |
+| DropPoint 投放点 | 所属地块、坐标、编号、**可容纳箱数**、遮阴条件、水源距离、投放时间窗、撤场时间、责任人（不挂群号） | 托管队 | `dropPoints` |
+| BeeColony 蜂群 | 群号、群系 `groupId`、蜂种、群势（足框）、箱型、当前所在地块、状态、最近检查日期、健康备注 | 技术员 | `colonies` |
+| Placement 箱位安排 | 某群（按**群 id** 引用）在某投放点占多少箱；并群 / 拆群只转 id，不随群号失效 | 技术员 | `placements` |
+| ColonyChange 分并变更单 | 并群 / 拆群登记（待执行 / 成功 / 失败）、失败原因、拆群两组群号群势、退回待投放的溢出箱位 | 技术员 | `colonyChanges` |
+| TransitRoute 转场路线 | 出发/到达投放点、预计里程与耗时、车辆类型、出发时刻、风险备注、实际记录 | 共用 | `routes` |
+
+### 两边各管各的
+
+- **托管队**在「果园地块管理」里只维护地块与投放点（容量、时间窗、责任人），页面上的已排群号为只读汇总；
+- **技术员**在「蜂群台账」里维护蜂群、投放点箱位安排与分并变更，群号怎么换都不影响投放点。
 
 - 数据库名 `gbbeeroute`，`meta` 表保存 `schemaVersion`；
 - `version(2)` 升级迁移会为历史投放点补齐「可容纳箱数」（默认 8 箱）；
+- `version(3)` 职责拆分：
+  - 投放点上的 `colonyCodes` 群号串迁移为独立 `placements`（每群号按 1 箱记，按群 id 引用），投放点不再保留群号；
+  - 历史蜂群没有群势关系，按**各自独立一群**补 `groupId`（取自身 id）；
+  - 新增 `colonyChanges` 表；
 - 数据仅存于浏览器本地，容器无状态、不挂载命名卷。
 
 ## 七、主要页面
@@ -93,12 +104,23 @@ sologsb-1117/
 | 路由 | 功能 |
 | --- | --- |
 | `/` | 季内授粉安排总表：花期条带 + 已投放群体，冲突（同一蜂群被排入花期重叠的不同地块）标红并汇总 |
-| `/orchards` | 果园地块管理：面积与需蜂强度自动算建议箱数、可达性标记、花期重叠提示、投放点维护（含坐标拾取） |
-| `/colonies` | 蜂群台账：按群势与状态筛选，批量改状态、批量记录检查备注 |
+| `/orchards` | 果园地块管理（托管队）：面积与需蜂强度自动算建议箱数、可达性标记、花期重叠提示、投放点维护（含坐标拾取与容量编辑）；不排群号 |
+| `/colonies` | 蜂群台账（技术员）：按群势与状态筛选，批量改状态、批量记录检查备注；维护投放点箱位安排、并群 / 拆群变更与失败重试 |
 | `/routes` | 转场路线规划：地图依次选点生成顺序与里程，拖动或上下移动调整顺序并实时重算，写回路线表 |
-| `/export` | 导出授粉安排清单 / 转场路线表（CSV）、全量 JSON 备份，并提供横向/纵向打印视图 |
+| `/export` | 导出授粉安排清单 / 转场路线表（CSV，清单含群号与箱数）、全量 JSON 备份，并提供横向/纵向打印视图 |
 
-## 八、计算约定
+## 八、分并与容量重算约定
+
+- **并群**：被并群在各投放点的箱位整串转到留下的群（同一点合并计数），蜂群删除、群系保留；现场若有投放点超容则整单**失败保留**，蜂群与箱位不动；
+- **拆群**：按两组群势之比在每个投放点拆分原群箱位（最大余数法，强组保底）；某点一箱都分不到的组生成**溢出槽**并退回「待投放」；
+- **容量改动即重算**：任何投放点保存（含改容量）、箱位调整后都跑统一 reconcile，顺序为：
+  1. 超容量裁剪（按群号倒序逐群减，减空的群退回待投放）；
+  2. 重放「待执行 / 失败」的分并变更（按登记先后）；
+  3. 拆群溢出箱位按剩余容量回原投放点入座，蜂群恢复在园；
+  4. 兜底再裁一次保证不超容；
+- **失败留单**：分并不成只记原因，不删单、不改既有投放安排，容量调整后可单张或全部重试；成功记录可删除（不影响已落定的蜂群与箱位）。
+
+## 九、其他计算约定
 
 - 建议箱数 = ⌈面积(亩) × 需蜂强度(箱/亩)⌉，最少 1 箱；
 - 转场里程按 Haversine 球面距离累计，耗时按平均 32 km/h + 0.25 h 装卸估算；

@@ -1,21 +1,28 @@
 import { useStore } from 'zustand'
 import type { StoreApi, UseBoundStore } from 'zustand'
 import Dexie, { type Table } from 'dexie'
-import type { BeeColony, DropPoint, Orchard, TransitRoute } from '@/types'
+import type { BeeColony, ColonyChange, DropPoint, Orchard, Placement, TransitRoute } from '@/types'
 
 /** IndexedDB 数据结构版本号 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
 }
 
-/** Dexie 封装：果园 / 蜂群 / 投放点 / 转场路线 四张表 + 元数据表 */
+/**
+ * Dexie 封装：
+ * 托管队侧 —— 果园 orchards / 投放点 dropPoints（只存地块与容量）；
+ * 技术员侧 —— 蜂群 colonies / 箱位安排 placements / 分并变更 colonyChanges；
+ * 另含转场路线 routes 与元数据 meta。
+ */
 class BeeRouteDb extends Dexie {
   orchards!: Table<Orchard, string>
   colonies!: Table<BeeColony, string>
   dropPoints!: Table<DropPoint, string>
+  placements!: Table<Placement, string>
+  colonyChanges!: Table<ColonyChange, string>
   routes!: Table<TransitRoute, string>
   meta!: Table<MetaRow, string>
 
@@ -29,23 +36,68 @@ class BeeRouteDb extends Dexie {
       meta: 'key'
     })
     // v2：投放点新增「可容纳箱数」字段，迁移时为历史投放点补齐（按 8 箱兜底）
+    this.version(2).stores({
+      orchards: 'id, name, crop, bloomStart',
+      colonies: 'id, code, status, currentOrchardId',
+      dropPoints: 'id, orchardId, code, dropWindow',
+      routes: 'id, fromDropId, toDropId, departAt',
+      meta: 'key'
+    })
+    // v3：职责拆分——投放点不再挂群号；箱位安排独立成 placements（按群 id 引用），
+    // 新增 colonyChanges 分并变更单，蜂群新增 groupId 群系字段
     this.version(SCHEMA_VERSION)
       .stores({
         orchards: 'id, name, crop, bloomStart',
-        colonies: 'id, code, status, currentOrchardId',
+        colonies: 'id, code, status, currentOrchardId, groupId',
         dropPoints: 'id, orchardId, code, dropWindow',
+        placements: 'id, colonyId, dropId',
+        colonyChanges: 'id, kind, status, createdAt',
         routes: 'id, fromDropId, toDropId, departAt',
         meta: 'key'
       })
       .upgrade(async (tx) => {
-        await tx
-          .table<DropPoint, string>('dropPoints')
-          .toCollection()
-          .modify((point) => {
-            if (!point.capacityBoxes) {
-              point.capacityBoxes = 8
-            }
+        // v2 迁移在旧库上会先跑，capacityBoxes 已补齐；这里把历史投放点上的群号
+        // 转成独立的箱位安排，每个群号按 1 箱记（旧数据没有箱数粒度）
+        const dropTable = tx.table<DropPoint & { colonyCodes?: string[] }, string>('dropPoints')
+        const colonyTable = tx.table<BeeColony, string>('colonies')
+        const placementTable = tx.table<Placement, string>('placements')
+
+        const oldDrops = await dropTable.toCollection().toArray()
+        const oldColonies = await colonyTable.toCollection().toArray()
+        const codeToColony = new Map(oldColonies.map((item) => [item.code, item]))
+
+        // 旧数据没有群势关系：每群各自独立一群，groupId 用自身 id 补上
+        oldColonies.forEach((colony) => {
+          if (!colony.groupId) {
+            colony.groupId = colony.id
+          }
+        })
+
+        const placements: Placement[] = []
+        oldDrops.forEach((point, pointIndex) => {
+          // 兜底再补一次容量：链式升级时 v2 的 modify 结果不保证先于本事务落盘
+          if (!point.capacityBoxes) {
+            point.capacityBoxes = 8
+          }
+          const codes = Array.from(new Set(point.colonyCodes ?? []))
+          codes.forEach((code, codeIndex) => {
+            const colony = codeToColony.get(code)
+            if (!colony) return
+            placements.push({
+              id: `plc_mig_${pointIndex}_${codeIndex}`,
+              colonyId: colony.id,
+              dropId: point.id,
+              boxes: 1
+            })
           })
+          // 投放点不再保留群号串
+          delete point.colonyCodes
+        })
+        await colonyTable.bulkPut(oldColonies)
+        await dropTable.bulkPut(oldDrops)
+        if (placements.length > 0) {
+          await placementTable.bulkPut(placements)
+        }
       })
   }
 }
@@ -147,6 +199,7 @@ export async function seedDemoData(): Promise<void> {
       species: '意蜂',
       strengthFrames: 8,
       boxType: '标准继箱',
+      groupId: 'grp_001',
       currentOrchardId: 'orc_ap',
       status: '在园',
       lastCheckDate: `${year}-04-09`,
@@ -158,6 +211,7 @@ export async function seedDemoData(): Promise<void> {
       species: '意蜂',
       strengthFrames: 6,
       boxType: '标准继箱',
+      groupId: 'grp_002',
       currentOrchardId: 'orc_rape',
       status: '转场中',
       lastCheckDate: `${year}-04-05`,
@@ -169,6 +223,7 @@ export async function seedDemoData(): Promise<void> {
       species: '中蜂',
       strengthFrames: 4,
       boxType: '平箱',
+      groupId: 'grp_003',
       currentOrchardId: '',
       status: '待投放',
       lastCheckDate: `${year}-04-02`,
@@ -188,8 +243,7 @@ export async function seedDemoData(): Promise<void> {
       waterDistance: 220,
       dropWindow: `${year}-04-07`,
       withdrawTime: `${year}-04-19`,
-      owner: '周园主',
-      colonyCodes: ['Q-01']
+      owner: '周园主'
     },
     {
       id: 'dp_b01',
@@ -202,8 +256,7 @@ export async function seedDemoData(): Promise<void> {
       waterDistance: 480,
       dropWindow: `${year}-03-27`,
       withdrawTime: `${year}-04-13`,
-      owner: '合作社',
-      colonyCodes: ['Q-02']
+      owner: '合作社'
     },
     {
       id: 'dp_c01',
@@ -216,9 +269,14 @@ export async function seedDemoData(): Promise<void> {
       waterDistance: 350,
       dropWindow: `${year}-04-11`,
       withdrawTime: `${year}-04-22`,
-      owner: '李园主',
-      colonyCodes: ['Q-02']
+      owner: '李园主'
     }
+  ])
+
+  await db.placements.bulkPut([
+    { id: 'plc_001_a01', colonyId: 'col_001', dropId: 'dp_a01', boxes: 6 },
+    { id: 'plc_002_b01', colonyId: 'col_002', dropId: 'dp_b01', boxes: 4 },
+    { id: 'plc_002_c01', colonyId: 'col_002', dropId: 'dp_c01', boxes: 2 }
   ])
 
   await db.routes.bulkPut([

@@ -9,6 +9,7 @@ import { usePersistentStore } from '@/hooks/usePersistentStore'
 import { orchardStore } from '@/stores/orchardStore'
 import { droppointStore } from '@/stores/droppointStore'
 import { colonyStore } from '@/stores/colonyStore'
+import { placementStore } from '@/stores/placementStore'
 import { bloomDays } from '@/utils/geo'
 import { uid } from '@/utils/id'
 
@@ -32,7 +33,6 @@ interface DropFormValues {
   dropWindow: dayjs.Dayjs
   withdrawTime: dayjs.Dayjs
   owner: string
-  colonyCodes: string[]
 }
 
 /** 果园地块管理：录入面积与花期后自动给出建议箱数与可达性标记，并维护投放点 */
@@ -40,6 +40,7 @@ export default function OrchardsPage(): JSX.Element {
   const orchards = usePersistentStore(orchardStore, (state) => state.rows)
   const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
   const colonies = usePersistentStore(colonyStore, (state) => state.rows)
+  const placements = usePersistentStore(placementStore, (state) => state.rows)
 
   const [orchardModal, setOrchardModal] = useState(false)
   const [editingOrchard, setEditingOrchard] = useState<Orchard | null>(null)
@@ -48,6 +49,7 @@ export default function OrchardsPage(): JSX.Element {
 
   const [dropModal, setDropModal] = useState(false)
   const [dropOwner, setDropOwner] = useState<Orchard | null>(null)
+  const [editingDrop, setEditingDrop] = useState<DropPoint | null>(null)
   const [dropCoord, setDropCoord] = useState({ longitude: 107.41, latitude: 34.61 })
   const [dropForm] = Form.useForm<DropFormValues>()
 
@@ -62,6 +64,20 @@ export default function OrchardsPage(): JSX.Element {
     () => (orchardId: string): DropPoint[] => dropPoints.filter((item) => item.orchardId === orchardId),
     [dropPoints]
   )
+
+  /** 投放点占用：技术员侧的箱位安排只读汇总，托管队不在这里排群号 */
+  const dropUsage = useMemo(() => {
+    const codeOf = new Map(colonies.map((item) => [item.id, item.code]))
+    const map = new Map<string, { used: number; codes: string[] }>()
+    placements.forEach((item) => {
+      const entry = map.get(item.dropId) ?? { used: 0, codes: [] }
+      entry.used += item.boxes
+      const code = codeOf.get(item.colonyId)
+      if (code) entry.codes.push(`${code}×${item.boxes}`)
+      map.set(item.dropId, entry)
+    })
+    return map
+  }, [placements, colonies])
 
   function openCreate(): void {
     setEditingOrchard(null)
@@ -134,6 +150,7 @@ export default function OrchardsPage(): JSX.Element {
 
   function openDrop(orchard: Orchard): void {
     setDropOwner(orchard)
+    setEditingDrop(null)
     setDropCoord({ longitude: orchard.longitude, latitude: orchard.latitude })
     const index = dropPoints.filter((item) => item.orchardId === orchard.id).length + 1
     dropForm.setFieldsValue({
@@ -143,8 +160,24 @@ export default function OrchardsPage(): JSX.Element {
       waterDistance: 300,
       dropWindow: dayjs(orchard.bloomStart).subtract(1, 'day'),
       withdrawTime: dayjs(orchard.bloomEnd).add(1, 'day'),
-      owner: '',
-      colonyCodes: []
+      owner: ''
+    })
+    setDropModal(true)
+  }
+
+  function openEditDrop(drop: DropPoint): void {
+    const orchard = orchards.find((item) => item.id === drop.orchardId) ?? null
+    setDropOwner(orchard)
+    setEditingDrop(drop)
+    setDropCoord({ longitude: drop.longitude, latitude: drop.latitude })
+    dropForm.setFieldsValue({
+      code: drop.code,
+      capacityBoxes: drop.capacityBoxes,
+      shade: drop.shade,
+      waterDistance: drop.waterDistance,
+      dropWindow: dayjs(drop.dropWindow),
+      withdrawTime: dayjs(drop.withdrawTime),
+      owner: drop.owner
     })
     setDropModal(true)
   }
@@ -153,7 +186,7 @@ export default function OrchardsPage(): JSX.Element {
     if (!dropOwner) return
     const values = await dropForm.validateFields()
     const row: DropPoint = {
-      id: uid('dp'),
+      id: editingDrop?.id ?? uid('dp'),
       orchardId: dropOwner.id,
       longitude: dropCoord.longitude,
       latitude: dropCoord.latitude,
@@ -163,11 +196,14 @@ export default function OrchardsPage(): JSX.Element {
       waterDistance: Number(values.waterDistance) || 0,
       dropWindow: values.dropWindow.format('YYYY-MM-DD'),
       withdrawTime: values.withdrawTime.format('YYYY-MM-DD'),
-      owner: values.owner?.trim() ?? '',
-      colonyCodes: values.colonyCodes ?? []
+      owner: values.owner?.trim() ?? ''
     }
     await droppointStore.getState().save(row)
-    message.success(`投放点 ${row.code} 已保存`)
+    message.success(
+      editingDrop
+        ? `投放点 ${row.code} 已更新，分并安排已按新容量重算`
+        : `投放点 ${row.code} 已保存`
+    )
     setDropModal(false)
   }
 
@@ -177,7 +213,7 @@ export default function OrchardsPage(): JSX.Element {
         <div>
           <h2 className="page-title">果园地块管理</h2>
           <p className="page-sub">
-            录入面积与需蜂强度后自动算出建议箱数；可达性以标签标记。每个地块可维护多个蜂群投放点（含可容纳箱数与时间窗）。
+            托管队只管地块与投放点：录入面积与需蜂强度后自动算出建议箱数，维护投放点容量与时间窗。具体排哪群蜂、分群并群由技术员在「蜂群台账」里安排；改动容量后分并安排会自动重算。
           </p>
         </div>
         <Button type="primary" onClick={openCreate}>
@@ -227,24 +263,52 @@ export default function OrchardsPage(): JSX.Element {
                 rowKey="id"
                 locale={{ emptyText: '暂无投放点' }}
                 columns={[
-                  { title: '编号', dataIndex: 'code', key: 'code', width: 80 },
-                  { title: '可容纳', dataIndex: 'capacityBoxes', key: 'cap', width: 80, render: (value: number) => `${value} 箱` },
-                  { title: '投放窗', dataIndex: 'dropWindow', key: 'win', width: 110 },
-                  { title: '撤场', dataIndex: 'withdrawTime', key: 'with', width: 110 },
+                  { title: '编号', dataIndex: 'code', key: 'code', width: 72 },
                   {
-                    title: '安排群号',
+                    title: '容量/占用',
+                    key: 'cap',
+                    width: 100,
+                    render: (_, record) => {
+                      const usage = dropUsage.get(record.id)
+                      const used = usage?.used ?? 0
+                      return (
+                        <Tag color={used > record.capacityBoxes ? 'red' : used === record.capacityBoxes ? 'gold' : 'green'}>
+                          {used} / {record.capacityBoxes} 箱
+                        </Tag>
+                      )
+                    }
+                  },
+                  { title: '投放窗', dataIndex: 'dropWindow', key: 'win', width: 104 },
+                  { title: '撤场', dataIndex: 'withdrawTime', key: 'with', width: 104 },
+                  {
+                    title: '技术员安排',
                     key: 'codes',
-                    render: (_, record: DropPoint) =>
-                      record.colonyCodes.length > 0 ? record.colonyCodes.join('、') : '—'
+                    render: (_, record) => {
+                      const usage = dropUsage.get(record.id)
+                      return usage && usage.codes.length > 0 ? (
+                        <Space size={4} wrap>
+                          {usage.codes.map((text) => (
+                            <Tag key={text}>{text}</Tag>
+                          ))}
+                        </Space>
+                      ) : (
+                        <Typography.Text type="secondary">待技术员排群</Typography.Text>
+                      )
+                    }
                   },
                   {
                     title: '操作',
                     key: 'action',
-                    width: 80,
-                    render: (_, record: DropPoint) => (
-                      <Button size="small" danger type="link" onClick={() => void droppointStore.getState().remove(record.id)}>
-                        删除
-                      </Button>
+                    width: 100,
+                    render: (_, record) => (
+                      <Space size={0}>
+                        <Button size="small" type="link" onClick={() => openEditDrop(record)}>
+                          编辑
+                        </Button>
+                        <Button size="small" danger type="link" onClick={() => void droppointStore.getState().remove(record.id)}>
+                          删除
+                        </Button>
+                      </Space>
                     )
                   }
                 ]}
@@ -311,7 +375,7 @@ export default function OrchardsPage(): JSX.Element {
       </Modal>
 
       <Modal
-        title={`新增投放点 · ${dropOwner?.name ?? ''}`}
+        title={`${editingDrop ? '编辑投放点' : '新增投放点'} · ${dropOwner?.name ?? ''}`}
         open={dropModal}
         onCancel={() => setDropModal(false)}
         onOk={() => void submitDrop()}
@@ -355,12 +419,10 @@ export default function OrchardsPage(): JSX.Element {
                 <Input placeholder="如 北侧有防风林，午后半阴" />
               </Form.Item>
             </Col>
-            <Col span={24}>
-              <Form.Item name="colonyCodes" label="安排群号（同一群跨地块重叠即冲突）">
-                <Select mode="multiple" options={colonies.map((item) => ({ value: item.code, label: `${item.code}（${item.species} ${item.strengthFrames} 足框）` }))} />
-              </Form.Item>
-            </Col>
           </Row>
+          <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 8 }}>
+            投放点只登记容量，不在这里排群号；蜂群入点、并群、拆群由技术员在「蜂群台账」里安排。容量一改，已有的分并安排会自动重算。
+          </Typography.Paragraph>
           <Form.Item label="经纬度">
             <CoordPicker value={dropCoord} onChange={setDropCoord} orchards={orchards} dropPoints={dropPoints} />
           </Form.Item>

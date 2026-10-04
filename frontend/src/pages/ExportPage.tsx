@@ -1,12 +1,13 @@
 import { useMemo, useState } from 'react'
 import { Button, Card, Col, Radio, Row, Space, Table, Tag, Typography, message } from 'antd'
 import dayjs from 'dayjs'
-import type { BeeColony, DropPoint, Orchard, TransitRoute } from '@/types'
+import type { BeeColony, DropPoint, Orchard, Placement, TransitRoute } from '@/types'
 import { suggestColonyBoxes } from '@/types'
 import { usePersistentStore } from '@/hooks/usePersistentStore'
 import { orchardStore } from '@/stores/orchardStore'
 import { colonyStore } from '@/stores/colonyStore'
 import { droppointStore } from '@/stores/droppointStore'
+import { placementStore } from '@/stores/placementStore'
 import { routeStore } from '@/stores/routeStore'
 import { downloadCsv, downloadJson } from '@/utils/export'
 import { bloomDays } from '@/utils/geo'
@@ -19,7 +20,9 @@ interface ScheduleExportRow {
   days: number
   suggestBoxes: number
   dropCode: string
+  capacity: number
   colonyCode: string
+  boxes: number | string
   dropWindow: string
   withdrawTime: string
   owner: string
@@ -30,12 +33,14 @@ export default function ExportPage(): JSX.Element {
   const orchards = usePersistentStore(orchardStore, (state) => state.rows)
   const colonies = usePersistentStore(colonyStore, (state) => state.rows)
   const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
+  const placements = usePersistentStore(placementStore, (state) => state.rows)
   const routes = usePersistentStore(routeStore, (state) => state.rows)
   const [orientation, setOrientation] = useState<'portrait' | 'landscape'>('landscape')
 
   const orchardName = (id: string): string => orchards.find((item) => item.id === id)?.name ?? '未知地块'
+  const colonyCode = new Map(colonies.map((item) => [item.id, item.code]))
 
-  /** 授粉安排清单：地块 × 投放点 × 群号 */
+  /** 授粉安排清单：地块 × 投放点 × 箱位安排（群号 + 箱数） */
   const scheduleRows = useMemo<ScheduleExportRow[]>(() => {
     const rows: ScheduleExportRow[] = []
     orchards.forEach((orchard: Orchard) => {
@@ -49,26 +54,31 @@ export default function ExportPage(): JSX.Element {
         suggestBoxes: suggestColonyBoxes(orchard)
       }
       if (points.length === 0) {
-        rows.push({ ...base, dropCode: '—', colonyCode: '—', dropWindow: '—', withdrawTime: '—', owner: '—' })
+        rows.push({ ...base, dropCode: '—', capacity: 0, colonyCode: '—', boxes: '—', dropWindow: '—', withdrawTime: '—', owner: '—' })
         return
       }
       points.forEach((point: DropPoint) => {
-        if (point.colonyCodes.length === 0) {
+        const slots = placements.filter((item) => item.dropId === point.id)
+        if (slots.length === 0) {
           rows.push({
             ...base,
             dropCode: point.code,
-            colonyCode: '待分配',
+            capacity: point.capacityBoxes,
+            colonyCode: '待技术员排群',
+            boxes: 0,
             dropWindow: point.dropWindow,
             withdrawTime: point.withdrawTime,
             owner: point.owner || '—'
           })
           return
         }
-        point.colonyCodes.forEach((code) => {
+        slots.forEach((slot: Placement) => {
           rows.push({
             ...base,
             dropCode: point.code,
-            colonyCode: code,
+            capacity: point.capacityBoxes,
+            colonyCode: colonyCode.get(slot.colonyId) ?? '已删群',
+            boxes: slot.boxes,
             dropWindow: point.dropWindow,
             withdrawTime: point.withdrawTime,
             owner: point.owner || '—'
@@ -77,7 +87,7 @@ export default function ExportPage(): JSX.Element {
       })
     })
     return rows
-  }, [orchards, dropPoints])
+  }, [orchards, dropPoints, placements, colonyCode])
 
   const routeRows = useMemo(
     () =>
@@ -108,7 +118,9 @@ export default function ExportPage(): JSX.Element {
       { key: 'days', label: '花期天数' },
       { key: 'suggestBoxes', label: '建议箱数' },
       { key: 'dropCode', label: '投放点' },
+      { key: 'capacity', label: '容量(箱)' },
       { key: 'colonyCode', label: '群号' },
+      { key: 'boxes', label: '箱数' },
       { key: 'dropWindow', label: '投放时间窗' },
       { key: 'withdrawTime', label: '撤场时间' },
       { key: 'owner', label: '责任人' }
@@ -136,6 +148,7 @@ export default function ExportPage(): JSX.Element {
       orchards,
       colonies,
       dropPoints,
+      placements,
       routes
     })
     message.success('全量数据已导出为 JSON 备份')
@@ -148,7 +161,7 @@ export default function ExportPage(): JSX.Element {
         <div>
           <h2 className="page-title">导出与打印</h2>
           <p className="page-sub">
-            导出授粉安排清单（地块、群号、投放点、时刻、里程）与转场路线表，或直接使用打印视图现场交底。
+            导出授粉安排清单（地块、群号、投放点、箱数、时刻、里程）与转场路线表，或直接使用打印视图现场交底。清单按技术员侧箱位安排展开，并群 / 拆群后自动跟随群 id 更新。
           </p>
         </div>
         <Space>
@@ -170,6 +183,7 @@ export default function ExportPage(): JSX.Element {
           <Tag>地块 {orchards.length}</Tag>
           <Tag>蜂群 {colonies.length}</Tag>
           <Tag>投放点 {dropPoints.length}</Tag>
+          <Tag>箱位安排 {placements.length}</Tag>
           <Tag>路线 {routes.length}</Tag>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             生成时间 {dayjs().format('YYYY-MM-DD HH:mm')}
@@ -192,7 +206,9 @@ export default function ExportPage(): JSX.Element {
               { title: '天数', dataIndex: 'days', key: 'days', width: 70 },
               { title: '建议箱数', dataIndex: 'suggestBoxes', key: 'suggest', width: 90 },
               { title: '投放点', dataIndex: 'dropCode', key: 'drop', width: 90 },
-              { title: '群号', dataIndex: 'colonyCode', key: 'colony', width: 90 },
+              { title: '容量', dataIndex: 'capacity', key: 'capacity', width: 70 },
+              { title: '群号', dataIndex: 'colonyCode', key: 'colony', width: 100 },
+              { title: '箱数', dataIndex: 'boxes', key: 'boxes', width: 70 },
               { title: '投放时间窗', dataIndex: 'dropWindow', key: 'window' },
               { title: '撤场时间', dataIndex: 'withdrawTime', key: 'withdraw' },
               { title: '责任人', dataIndex: 'owner', key: 'owner' }
@@ -224,13 +240,18 @@ export default function ExportPage(): JSX.Element {
           <Card size="small" title="蜂群投放一览（按群号）">
             <Space direction="vertical">
               {colonies.map((colony: BeeColony) => {
-                const points = dropPoints.filter((item) => item.colonyCodes.includes(colony.code))
+                const slots = placements.filter((item) => item.colonyId === colony.id)
                 return (
                   <Typography.Text key={colony.id}>
                     <Tag color="cyan">{colony.code}</Tag>
                     {colony.species} · {colony.strengthFrames} 足框 ·{' '}
-                    {points.length > 0
-                      ? points.map((item) => `${item.code}@${orchardName(item.orchardId)}`).join('、')
+                    {slots.length > 0
+                      ? slots
+                          .map((slot) => {
+                            const point = dropPoints.find((item) => item.id === slot.dropId)
+                            return `${point?.code ?? '未知点'}×${slot.boxes}@${point ? orchardName(point.orchardId) : '未知地块'}`
+                          })
+                          .join('、')
                       : '尚未安排投放点'}
                   </Typography.Text>
                 )

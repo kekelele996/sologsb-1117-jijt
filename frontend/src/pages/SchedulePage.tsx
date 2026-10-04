@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Alert, Card, Col, Row, Segmented, Space, Table, Tag, Typography } from 'antd'
-import type { BeeColony, DropPoint, Orchard } from '@/types'
+import type { BeeColony, Orchard, Placement } from '@/types'
 import FlowerWindowBar from '@/components/common/FlowerWindowBar'
 import RouteMap from '@/components/common/RouteMap'
 import StatusTag from '@/components/common/StatusTag'
@@ -8,11 +8,12 @@ import { usePersistentStore } from '@/hooks/usePersistentStore'
 import { orchardStore } from '@/stores/orchardStore'
 import { colonyStore } from '@/stores/colonyStore'
 import { droppointStore } from '@/stores/droppointStore'
+import { placementStore } from '@/stores/placementStore'
 import { routeStore } from '@/stores/routeStore'
 import { bloomDays, flowerWindowOverlap } from '@/utils/geo'
 import { suggestColonyBoxes } from '@/types'
 
-interface Placement {
+interface PlacementView {
   colonyCode: string
   orchardId: string
   dropCode: string
@@ -22,8 +23,8 @@ interface Placement {
 
 interface ConflictItem {
   colonyCode: string
-  a: Placement
-  b: Placement
+  a: PlacementView
+  b: PlacementView
   days: number
   range: string
 }
@@ -43,21 +44,25 @@ export default function SchedulePage(): JSX.Element {
   const orchards = usePersistentStore(orchardStore, (state) => state.rows)
   const colonies = usePersistentStore(colonyStore, (state) => state.rows)
   const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
+  const placements = usePersistentStore(placementStore, (state) => state.rows)
   const routes = usePersistentStore(routeStore, (state) => state.rows)
   const [scope, setScope] = useState<'all' | 'conflict'>('all')
 
-  /** 由投放点的群号安排 + 蜂群当前所在地块，汇总出「某群在某地块」的时间占用 */
-  const placements = useMemo<Placement[]>(() => {
-    const list: Placement[] = []
-    dropPoints.forEach((point: DropPoint) => {
-      point.colonyCodes.forEach((code) => {
-        list.push({
-          colonyCode: code,
-          orchardId: point.orchardId,
-          dropCode: point.code,
-          start: point.dropWindow,
-          end: point.withdrawTime
-        })
+  /** 由技术员的箱位安排（placements）+ 蜂群当前所在地块，汇总「某群在某地块」的时间占用 */
+  const views = useMemo<PlacementView[]>(() => {
+    const list: PlacementView[] = []
+    const colonyById = new Map(colonies.map((item) => [item.id, item]))
+    const dropById = new Map(dropPoints.map((item) => [item.id, item]))
+    placements.forEach((slot: Placement) => {
+      const colony = colonyById.get(slot.colonyId)
+      const point = dropById.get(slot.dropId)
+      if (!colony || !point) return
+      list.push({
+        colonyCode: colony.code,
+        orchardId: point.orchardId,
+        dropCode: point.code,
+        start: point.dropWindow,
+        end: point.withdrawTime
       })
     })
     colonies.forEach((colony: BeeColony) => {
@@ -75,14 +80,14 @@ export default function SchedulePage(): JSX.Element {
       })
     })
     return list
-  }, [dropPoints, colonies, orchards])
+  }, [placements, dropPoints, colonies, orchards])
 
   /** 同一蜂群同一天被排入两个地块 → 冲突列表 */
   const conflicts = useMemo<ConflictItem[]>(() => {
     const result: ConflictItem[] = []
-    const codes = Array.from(new Set(placements.map((item) => item.colonyCode)))
+    const codes = Array.from(new Set(views.map((item) => item.colonyCode)))
     codes.forEach((code) => {
-      const list = placements.filter((item) => item.colonyCode === code)
+      const list = views.filter((item) => item.colonyCode === code)
       for (let i = 0; i < list.length; i += 1) {
         for (let j = i + 1; j < list.length; j += 1) {
           if (list[i].orchardId === list[j].orchardId) continue
@@ -94,12 +99,12 @@ export default function SchedulePage(): JSX.Element {
       }
     })
     return result
-  }, [placements])
+  }, [views])
 
   const rows = useMemo<ScheduleRow[]>(
     () =>
       orchards.map((orchard) => {
-        const related = placements.filter((item) => item.orchardId === orchard.id)
+        const related = views.filter((item) => item.orchardId === orchard.id)
         return {
           key: orchard.id,
           orchard,
@@ -110,7 +115,7 @@ export default function SchedulePage(): JSX.Element {
           conflicted: conflicts.some((item) => item.a.orchardId === orchard.id || item.b.orchardId === orchard.id)
         }
       }),
-    [orchards, placements, conflicts]
+    [orchards, views, conflicts]
   )
 
   const visibleRows = scope === 'conflict' ? rows.filter((row) => row.conflicted) : rows
