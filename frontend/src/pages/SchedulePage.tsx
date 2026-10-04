@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Alert, Card, Col, Row, Segmented, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Col, Row, Segmented, Space, Table, Tag, Typography } from 'antd'
 import type { BeeColony, DropPoint, Orchard } from '@/types'
 import FlowerWindowBar from '@/components/common/FlowerWindowBar'
 import RouteMap from '@/components/common/RouteMap'
@@ -9,6 +9,8 @@ import { orchardStore } from '@/stores/orchardStore'
 import { colonyStore } from '@/stores/colonyStore'
 import { droppointStore } from '@/stores/droppointStore'
 import { routeStore } from '@/stores/routeStore'
+import { colonyChangeStore } from '@/stores/colonyChangeStore'
+import { recomputeAll } from '@/services/colonyChangeEngine'
 import { bloomDays, flowerWindowOverlap } from '@/utils/geo'
 import { suggestColonyBoxes } from '@/types'
 
@@ -44,7 +46,19 @@ export default function SchedulePage(): JSX.Element {
   const colonies = usePersistentStore(colonyStore, (state) => state.rows)
   const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
   const routes = usePersistentStore(routeStore, (state) => state.rows)
+  const changes = usePersistentStore(colonyChangeStore, (state) => state.rows)
   const [scope, setScope] = useState<'all' | 'conflict'>('all')
+
+  const pendingChanges = changes.filter((item) => item.status === '待重试')
+
+  async function retryChanges(): Promise<void> {
+    await recomputeAll()
+    await Promise.all([
+      colonyStore.getState().hydrate(),
+      droppointStore.getState().hydrate(),
+      colonyChangeStore.getState().hydrate()
+    ])
+  }
 
   /** 由投放点的群号安排 + 蜂群当前所在地块，汇总出「某群在某地块」的时间占用 */
   const placements = useMemo<Placement[]>(() => {
@@ -138,6 +152,28 @@ export default function SchedulePage(): JSX.Element {
           ]}
         />
       </div>
+
+      {pendingChanges.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          message={`${pendingChanges.length} 笔分并变更失败待重试（投放点安排仍照旧执行）`}
+          description={
+            <Space direction="vertical" align="start" size={4}>
+              <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+                {pendingChanges.map((item) => (
+                  <li key={item.id}>
+                    {item.type}：{item.note}
+                  </li>
+                ))}
+              </ul>
+              <Button size="small" type="primary" onClick={() => void retryChanges()}>
+                立即重算并重试
+              </Button>
+            </Space>
+          }
+        />
+      ) : null}
 
       {conflicts.length > 0 ? (
         <Alert

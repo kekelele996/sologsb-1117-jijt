@@ -53,6 +53,7 @@ cd frontend
 npm install
 npm run dev        # http://localhost:21817
 npm run build      # 类型检查 + 生产构建
+npm run test:engine  # 分并引擎用例（fake-indexeddb 内存库）
 ```
 
 ## 五、目录结构
@@ -66,8 +67,10 @@ sologsb-1117/
 │   ├── nginx.conf              # try_files 前端路由回落 + gzip
 │   ├── public/favicon.svg
 │   └── src/
-│       ├── types/              # orchard.ts / colony.ts / droppoint.ts / route.ts / index.ts
-│       ├── stores/             # orchardStore / colonyStore / droppointStore / routeStore（Zustand）
+│       ├── types/              # orchard.ts / colony.ts（含 ColonyChange）/ droppoint.ts / route.ts / index.ts
+│       ├── stores/             # orchardStore / colonyStore / colonyChangeStore / droppointStore / routeStore（Zustand）
+│       ├── services/           # colonyChangeEngine：并群/拆群执行、容量重算与失败重试
+│       ├── scripts/            # engine.test.ts：分并引擎用例（fake-indexeddb，npm run test:engine）
 │       ├── components/common/  # RouteMap / FlowerWindowBar / StatusTag / CoordPicker
 │       ├── hooks/              # useAmap / usePersistentStore
 │       ├── pages/              # SchedulePage / OrchardsPage / ColoniesPage / RoutesPage / ExportPage
@@ -80,21 +83,34 @@ sologsb-1117/
 | 模型 | 说明 | Dexie 表 |
 | --- | --- | --- |
 | Orchard 果园地块 | 地块名、作物、面积、经纬度、盛花期起止、需蜂强度（箱/亩）、园主联系方式、可达性、历史授粉年份 | `orchards` |
-| BeeColony 蜂群 | 群号、蜂种、群势（足框）、箱型、当前所在地块、状态（待投放/在园/转场中/回场）、最近检查日期、健康备注 | `colonies` |
+| BeeColony 蜂群 | 群号、蜂种、群势（足框）、箱型、当前所在地块、状态（待投放/在园/转场中/回场）、最近检查日期、健康备注、分并谱系号 `groupId` | `colonies` |
+| ColonyChange 分并变更 | 技术员的并群/拆群单据（含箱位计划与群势次序），失败保留为「待重试」 | `colonyChanges` |
 | DropPoint 投放点 | 所属地块、坐标、编号、可容纳箱数、遮阴条件、水源距离、投放时间窗、撤场时间、责任人、安排群号 | `dropPoints` |
 | TransitRoute 转场路线 | 出发/到达投放点、预计里程与耗时、车辆类型、出发时刻、风险备注、实际记录 | `routes` |
 
 - 数据库名 `gbbeeroute`，`meta` 表保存 `schemaVersion`；
 - `version(2)` 升级迁移会为历史投放点补齐「可容纳箱数」（默认 8 箱）；
+- `version(3)` 新增「分并变更」表与蜂群谱系号：历史蜂群没有群势关系的，各自按独立一群补上 `groupId = 自身 id`；
 - 数据仅存于浏览器本地，容器无状态、不挂载命名卷。
+
+### 职责划分与分并规则
+
+托管队与技术员各管各的数据，群号不再需要手工对齐：
+
+- **托管队管地块与投放点**：只维护坐标、容量、时间窗、责任人等；投放点表格只读展示群号，新增/编辑投放点不直接改群号。
+- **技术员管蜂群与分并变更**：在「蜂群台账」维护档案、安排投放点（受容量约束）、执行并群/拆群。
+- **并群**：被并群号从台账移除，它们在所有投放点上的安排串转到留下群号（同一点重复只占一箱），群势累加。
+- **拆群**：源群按各组群势（最大余数法，强群优先拿投放窗早的箱位）把现占箱位分给两组或更多组，另生成同谱系新群；某箱装不下（容量不足）时该组退回「待投放」，计划保留在变更单上。
+- **容量一改动就重算**：投放点容量保存后立即重算——超容点优先退回最近拆群的弱组（全部退净则回待投放）；容量恢复时把拆群退回的子群按原计划补回，并顺带重试待重试的分并变更。
+- **分并失败不影响现场安排**：群号不存在等校验失败时只落一张「待重试」变更单，投放点安排照旧；群号补齐后在蜂群台账或安排总表点「立即重算并重试」即可。
 
 ## 七、主要页面
 
 | 路由 | 功能 |
 | --- | --- |
 | `/` | 季内授粉安排总表：花期条带 + 已投放群体，冲突（同一蜂群被排入花期重叠的不同地块）标红并汇总 |
-| `/orchards` | 果园地块管理：面积与需蜂强度自动算建议箱数、可达性标记、花期重叠提示、投放点维护（含坐标拾取） |
-| `/colonies` | 蜂群台账：按群势与状态筛选，批量改状态、批量记录检查备注 |
+| `/orchards` | 果园地块管理（托管队）：面积与需蜂强度自动算建议箱数、可达性标记、花期重叠提示、投放点维护（坐标拾取、容量）；群号只读 |
+| `/colonies` | 蜂群台账（技术员）：按群势与状态筛选，批量改状态/检查备注；安排投放点；勾选蜂群执行并群/拆群，查看分并变更记录与失败重试 |
 | `/routes` | 转场路线规划：地图依次选点生成顺序与里程，拖动或上下移动调整顺序并实时重算，写回路线表 |
 | `/export` | 导出授粉安排清单 / 转场路线表（CSV）、全量 JSON 备份，并提供横向/纵向打印视图 |
 
@@ -102,4 +118,5 @@ sologsb-1117/
 
 - 建议箱数 = ⌈面积(亩) × 需蜂强度(箱/亩)⌉，最少 1 箱；
 - 转场里程按 Haversine 球面距离累计，耗时按平均 32 km/h + 0.25 h 装卸估算；
-- 花期重叠：两地块盛花期区间交集天数 ≥ 1 即视为重叠；同一群号在重叠期内被排入两个地块 → 冲突。
+- 花期重叠：两地块盛花期区间交集天数 ≥ 1 即视为重叠；同一群号在重叠期内被排入两个地块 → 冲突；
+- 拆群分箱：各组应得箱位 = 现占箱数按群势比例的最大余数分配（余数并列强群先得），放置时再受投放点容量约束。

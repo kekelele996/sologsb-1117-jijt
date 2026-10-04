@@ -1,22 +1,23 @@
 import { useStore } from 'zustand'
 import type { StoreApi, UseBoundStore } from 'zustand'
 import Dexie, { type Table } from 'dexie'
-import type { BeeColony, DropPoint, Orchard, TransitRoute } from '@/types'
+import type { BeeColony, ColonyChange, DropPoint, Orchard, TransitRoute } from '@/types'
 
 /** IndexedDB 数据结构版本号 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
 }
 
-/** Dexie 封装：果园 / 蜂群 / 投放点 / 转场路线 四张表 + 元数据表 */
+/** Dexie 封装：果园 / 蜂群 / 投放点 / 转场路线 / 分并变更 五张表 + 元数据表 */
 class BeeRouteDb extends Dexie {
   orchards!: Table<Orchard, string>
   colonies!: Table<BeeColony, string>
   dropPoints!: Table<DropPoint, string>
   routes!: Table<TransitRoute, string>
+  colonyChanges!: Table<ColonyChange, string>
   meta!: Table<MetaRow, string>
 
   constructor() {
@@ -29,7 +30,7 @@ class BeeRouteDb extends Dexie {
       meta: 'key'
     })
     // v2：投放点新增「可容纳箱数」字段，迁移时为历史投放点补齐（按 8 箱兜底）
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         orchards: 'id, name, crop, bloomStart',
         colonies: 'id, code, status, currentOrchardId',
@@ -44,6 +45,27 @@ class BeeRouteDb extends Dexie {
           .modify((point) => {
             if (!point.capacityBoxes) {
               point.capacityBoxes = 8
+            }
+          })
+      })
+    // v3：技术员侧新增「分并变更」表，蜂群补「群势关系」谱系号
+    this.version(SCHEMA_VERSION)
+      .stores({
+        orchards: 'id, name, crop, bloomStart',
+        colonies: 'id, code, status, currentOrchardId, groupId',
+        dropPoints: 'id, orchardId, code, dropWindow',
+        routes: 'id, fromDropId, toDropId, departAt',
+        colonyChanges: 'id, type, status, createdAt',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        // 旧数据没有群势关系：每群各补一个独立谱系
+        await tx
+          .table<BeeColony, string>('colonies')
+          .toCollection()
+          .modify((colony) => {
+            if (!colony.groupId) {
+              colony.groupId = colony.id
             }
           })
       })
@@ -150,7 +172,8 @@ export async function seedDemoData(): Promise<void> {
       currentOrchardId: 'orc_ap',
       status: '在园',
       lastCheckDate: `${year}-04-09`,
-      healthNote: '群势稳定，子脾整齐'
+      healthNote: '群势稳定，子脾整齐',
+      groupId: 'col_001'
     },
     {
       id: 'col_002',
@@ -161,7 +184,8 @@ export async function seedDemoData(): Promise<void> {
       currentOrchardId: 'orc_rape',
       status: '转场中',
       lastCheckDate: `${year}-04-05`,
-      healthNote: '轻微螨害，转场后需治螨'
+      healthNote: '轻微螨害，转场后需治螨',
+      groupId: 'col_002'
     },
     {
       id: 'col_003',
@@ -172,7 +196,8 @@ export async function seedDemoData(): Promise<void> {
       currentOrchardId: '',
       status: '待投放',
       lastCheckDate: `${year}-04-02`,
-      healthNote: '新分群，群势偏弱'
+      healthNote: '新分群，群势偏弱',
+      groupId: 'col_003'
     }
   ])
 

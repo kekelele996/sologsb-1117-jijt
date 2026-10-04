@@ -8,6 +8,7 @@ import { orchardStore } from '@/stores/orchardStore'
 import { colonyStore } from '@/stores/colonyStore'
 import { droppointStore } from '@/stores/droppointStore'
 import { routeStore } from '@/stores/routeStore'
+import { colonyChangeStore } from '@/stores/colonyChangeStore'
 import { downloadCsv, downloadJson } from '@/utils/export'
 import { bloomDays } from '@/utils/geo'
 
@@ -31,6 +32,7 @@ export default function ExportPage(): JSX.Element {
   const colonies = usePersistentStore(colonyStore, (state) => state.rows)
   const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
   const routes = usePersistentStore(routeStore, (state) => state.rows)
+  const colonyChanges = usePersistentStore(colonyChangeStore, (state) => state.rows)
   const [orientation, setOrientation] = useState<'portrait' | 'landscape'>('landscape')
 
   const orchardName = (id: string): string => orchards.find((item) => item.id === id)?.name ?? '未知地块'
@@ -136,7 +138,8 @@ export default function ExportPage(): JSX.Element {
       orchards,
       colonies,
       dropPoints,
-      routes
+      routes,
+      colonyChanges
     })
     message.success('全量数据已导出为 JSON 备份')
   }
@@ -171,6 +174,9 @@ export default function ExportPage(): JSX.Element {
           <Tag>蜂群 {colonies.length}</Tag>
           <Tag>投放点 {dropPoints.length}</Tag>
           <Tag>路线 {routes.length}</Tag>
+          {colonyChanges.filter((item) => item.status === '待重试').length > 0 ? (
+            <Tag color="red">待重试分并 {colonyChanges.filter((item) => item.status === '待重试').length}</Tag>
+          ) : null}
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             生成时间 {dayjs().format('YYYY-MM-DD HH:mm')}
           </Typography.Text>
